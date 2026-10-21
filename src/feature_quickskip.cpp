@@ -4,11 +4,12 @@
 //  Behaviour
 //  ---------
 //  While a tune is actually being played (MUSIC_PLAY child state = 0x23886000
-//  "PLAYING"), holding the four corner panels (1, 4, 13, 16 => bit mask 0x9009)
-//  for HoldMs milliseconds aborts the current tune and returns to the song
-//  select screen (MUSIC_SELECT), exactly the way the game itself performs a
-//  parent state transition on a normal play->result change, except we go to
-//  MUSIC_SELECT instead of MUSIC_RESULT.
+//  "PLAYING"), holding a configurable set of panels (default: the four corners
+//  1,4,13,16 => bit mask 0x9009, change with "Keys=" in the INI) for HoldMs
+//  milliseconds aborts the current tune and returns to the song select screen
+//  (MUSIC_SELECT), exactly the way the game itself performs a parent state
+//  transition on a normal play->result change, except we go to MUSIC_SELECT
+//  instead of MUSIC_RESULT.
 //
 //  Mechanism (all addresses verified for jubeat.dll build whose
 //  FileHeader.TimeDateStamp = 0x6a59f658, entry RVA 0x210560):
@@ -16,7 +17,8 @@
 //      the game thread.  We inline-hook it and chain to the original first, so
 //      the gftools input-device state map is already refreshed for this frame.
 //    * Held panel bitmap  = gftools.dll!GFInputDDevGetStateMap(2, MapField)
-//      (low 16 bits, bit i = panel i+1, row major).  corners = 0x9009.
+//      (low 16 bits, bit i = panel i+1, row major).  The trigger mask is
+//      configurable via "Keys=" (default 0x9009 = panels 1,4,13,16).
 //    * Play detection     = *(u32*)(jubeat_base + 0xFCA6A0 + 0x14) == 0x23880000
 //                           (MUSIC_LOOP FSM object's current state)
 //                           and *(u32*)(jubeat_base + 0xFCA6F8 + 0x14) == 0x23886000
@@ -46,6 +48,7 @@
 #include "feature.h"
 
 #include <windows.h>
+#include <cctype>
 #include <csetjmp>
 #include <cstdio>
 #include <cstdlib>
@@ -73,12 +76,13 @@ constexpr uint32_t ID_MUSIC_LOOP      = 0x23800000;
 constexpr uint32_t ID_MUSIC_PLAY      = 0x23880000;
 constexpr uint32_t ID_MUSIC_SELECT    = 0x23840000;
 constexpr uint32_t STATE_PLAYING      = 0x23886000;
-constexpr uint32_t CORNER_MASK        = 0x9009;      // panels 1,4,13,16
+constexpr uint32_t DEFAULT_KEYS       = 0x9009;      // panels 1,4,13,16
 
 // ---- configuration (jubeat_quickskip.ini) --------------------------------
 struct Config {
     bool     enabled      = true;
-    int      holdMs       = 300;    // how long all four corners must be held
+    uint32_t keysMask     = DEFAULT_KEYS; // panels to hold (bit i = panel i+1)
+    int      holdMs       = 300;    // how long the keys must be held together
     int      cooldownMs   = 1500;   // min time between two aborts
     int      mapField     = 1;      // GFInputDDevGetStateMap(2, field)
     bool     stopSfx      = true;   // also stop sound effects on abort
@@ -294,6 +298,44 @@ void Trim(std::string* s) {
     *s = s->substr(a, b - a + 1);
 }
 
+std::string DecodePanels(uint32_t mask);  // defined below
+
+// Parse the "Keys=" value: either a hex bitmask ("0x9009") or a comma/space
+// separated list of panel numbers ("1,4,13,16" / "1 4 13 16").  Bit i of the
+// returned mask means panel i+1 (1..16).  Invalid/empty input keeps the
+// default (four corners).
+uint32_t ParseKeys(const std::string& value, uint32_t def) {
+    std::string t;
+    for (char c : value) {
+        if (!isspace((unsigned char)c)) t += c;
+    }
+    if (t.empty()) return def;
+
+    uint32_t mask = 0;
+    if (t.size() > 2 && t[0] == '0' && (t[1] == 'x' || t[1] == 'X')) {
+        char* end = nullptr;
+        unsigned long x = strtoul(t.c_str(), &end, 16);
+        if (end && *end == 0) mask = (uint32_t)(x & 0xFFFFu);
+    } else {
+        const char* p = t.c_str();
+        while (*p) {
+            while (*p && !isdigit((unsigned char)*p)) ++p;
+            if (!*p) break;
+            char* end = nullptr;
+            long n = strtol(p, &end, 10);
+            if (end == p) break;
+            if (n >= 1 && n <= 16) mask |= (1u << (n - 1));
+            p = end;
+        }
+    }
+    if (mask == 0) {
+        Logf("quickskip: WARN invalid Keys value '%s', using default 0x%04X",
+             value.c_str(), (unsigned)def);
+        return def;
+    }
+    return mask;
+}
+
 void LoadConfig() {
     std::wstring ini = OwnModulePath();
     size_t dot = ini.find_last_of(L'.');
@@ -324,6 +366,7 @@ void LoadConfig() {
         for (char& c : key) c = (char)tolower((unsigned char)c);
         long v = strtol(val.c_str(), nullptr, 0);
         if (key == "enabled")        g_cfg.enabled = v != 0;
+        else if (key == "keys")      g_cfg.keysMask = ParseKeys(val, DEFAULT_KEYS);
         else if (key == "holdms")    g_cfg.holdMs = (int)v;
         else if (key == "cooldownms")g_cfg.cooldownMs = (int)v;
         else if (key == "mapfield")  g_cfg.mapField = (int)v;
@@ -332,10 +375,11 @@ void LoadConfig() {
         else Logf("quickskip: WARN unknown config key '%s'", key.c_str());
     }
     fclose(f);
-    Logf("quickskip: config enabled=%d holdMs=%d cooldownMs=%d mapField=%d "
-         "stopSfx=%d verbose=%d",
-         (int)g_cfg.enabled, g_cfg.holdMs, g_cfg.cooldownMs, g_cfg.mapField,
-         (int)g_cfg.stopSfx, (int)g_cfg.verbose);
+    Logf("quickskip: config enabled=%d keys=0x%04X panels=[%s] holdMs=%d "
+         "cooldownMs=%d mapField=%d stopSfx=%d verbose=%d",
+         (int)g_cfg.enabled, g_cfg.keysMask,
+         DecodePanels(g_cfg.keysMask).c_str(), g_cfg.holdMs, g_cfg.cooldownMs,
+         g_cfg.mapField, (int)g_cfg.stopSfx, (int)g_cfg.verbose);
 }
 
 // ---------------------------------------------------------------------------
@@ -369,11 +413,11 @@ bool ReadPanelMask(uint32_t* mask) {
     return true;
 }
 
-// Returns true when all four corner panels are held.
-bool CornersHeld() {
+// Returns true when all configured trigger panels are held together.
+bool TriggerHeld() {
     uint32_t mask = 0;
     if (!ReadPanelMask(&mask)) return false;
-    return (mask & CORNER_MASK) == CORNER_MASK;
+    return (mask & g_cfg.keysMask) == g_cfg.keysMask;
 }
 
 // Current tune is being played: MUSIC_LOOP in MUSIC_PLAY state and the
@@ -532,7 +576,7 @@ void __cdecl InputUpdateDetour() {
 
     if (inPlay) {
         g_everPlayed = true;
-        if (CornersHeld()) {
+        if (TriggerHeld()) {
             if (g_heldSinceMs == 0) g_heldSinceMs = now;
             uint32_t heldFor = now - g_heldSinceMs;
             bool cooldownOk =
@@ -546,10 +590,11 @@ void __cdecl InputUpdateDetour() {
                 ReadPanelMask(&mask);
                 SafeReadU32((uintptr_t)g_loopObj + OBJ_STATE, &loopState);
                 SafeReadU32((uintptr_t)g_playObj + OBJ_STATE, &playState);
-                Logf("quickskip: TRIGGER corners held %lu ms mask=0x%04X "
-                     "panels=[%s] loop=0x%08X play=0x%08X -> abort tune",
-                     (unsigned long)heldFor, mask, DecodePanels(mask).c_str(),
-                     loopState, playState);
+                Logf("quickskip: TRIGGER keys held %lu ms mask=0x%04X "
+                     "need=0x%04X panels=[%s] loop=0x%08X play=0x%08X "
+                     "-> abort tune",
+                     (unsigned long)heldFor, mask, g_cfg.keysMask,
+                     DecodePanels(mask).c_str(), loopState, playState);
                 g_abortAtMs = now;
                 g_abortStage = 1;
                 AbortTuneOnce();
@@ -695,8 +740,9 @@ bool TryInit() {
     g_inputUpdateOrig = (FnInputUpdate)trampoline;
     g_ready = true;
     Logf("quickskip: READY - input_update hooked at %p (trampoline %p) "
-         "holdMs=%d. Hold panels 1+4+13+16 during play to return to song "
-         "select.", target, trampoline, g_cfg.holdMs);
+         "keys=0x%04X panels=[%s] holdMs=%d. Hold those panels during play "
+         "to return to song select.", target, trampoline, g_cfg.keysMask,
+         DecodePanels(g_cfg.keysMask).c_str(), g_cfg.holdMs);
     return true;
 }
 

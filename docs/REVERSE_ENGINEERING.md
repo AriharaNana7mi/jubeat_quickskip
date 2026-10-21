@@ -284,7 +284,7 @@ input.dll!input_update()        input.dll RVA 0x1040
         dev2 bit i  ←  dev1/jamma bit [ 8, 4,19,15,  9, 5,20,16,  10, 6,21,17,  11, 7,22,18 ][i]
    · GFInputDDevUpdate(2)
 jubeat.dll 读 input.dll!input_panel_trg_on/off/short_on 判定命中；
-本插件读 GFInputDDevGetStateMap(2,1) 的按住位图判定四角（1/4/13/16 = bit 0/3/12/15 = 0x9009）。
+本插件读 GFInputDDevGetStateMap(2,1) 的按住位图判定触发组合（默认四角 1/4/13/16 = bit 0/3/12/15 = 0x9009；触发组合可配置，见 INI 的 `Keys=`）。
 ```
 
 关键结论：
