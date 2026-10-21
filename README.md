@@ -132,6 +132,25 @@ spice2x 的 `-exec <名字>` 用于手动指定游戏 DLL，但它会**跳过游
 
 ---
 
+### 实机（p4io）环境能用吗？
+
+能。插件不依赖 spice2x 的虚拟输入：面板状态最终来自 gftools 输入状态表，
+而实机路径是 `libp4io.dll`（真实 P4IO 板）→ `device.dll` 的 JAMMA 缓冲 → `input.dll`
+每帧按固定表生成 16 面板位图，和 PC 上虚拟输入的汇合点完全相同（详见
+[docs/REVERSE_ENGINEERING.md](docs/REVERSE_ENGINEERING.md) §7.5）。
+
+实机（`spice.exe -exec jubeat.dll ... -k <dll>`）验证清单：
+
+1. `contents\log.txt` 出现 `I:launcher: loading hook DLL ...`（说明 `-k` 执行了；游戏没成功加载的话这一行不会出现）。
+2. 插件日志（默认 `<DLL目录>\logs\jubeat_quickskip.log`）出现
+   `quickskip: READY - input_update hooked`、`FSM MUSIC_LOOP ok`、`FSM objects READY`。
+3. 游玩中真实按住四角约 0.3 秒 → 日志出现 `TRIGGER ... mask=0x9009` 并回到选曲。
+4. 如果第 2 步出现 `ERROR version mismatch`：你的机台游戏版本与 `0x6a59f658` 不同，
+   插件会自动禁用（不会改坏游戏），需要重新按 [docs/REVERSE_ENGINEERING.md](docs/REVERSE_ENGINEERING.md)
+   §7 的方法定位偏移后重编。
+
+---
+
 ## 配置
 
 `jubeat_quickskip.ini`（放在 DLL 旁边；全部可选）：

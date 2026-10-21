@@ -262,6 +262,42 @@ MUSIC_LOOP -> MUSIC_RESULT 的 SetNextState 调用点 (RVA 0x9D426):
 
 ---
 
+## 7.5 实机（p4io）输入路径
+
+插件本身**没有任何 p4io 相关代码**，也不需要：它只读 gftools 的输入设备状态表。
+而这张表在「spice2x 虚拟输入」和「实机 p4io 硬件输入」两条路径下，都是由游戏自己的
+`modules\device.dll` + `modules\input.dll` 填充的，所以两条路径等价。
+
+实机（p4io，jubeat 机台）链路（本轮补充逆向确认）：
+
+```
+libp4io.dll            p4io_get_jamma(jamma_out, ...)  ← 真实 P4IO 板（JAMMA 位图，低电平有效）
+   ↑ 导入              （device.dll 导入 p4io_get_jamma / p4io_get_jamma_hist / ...）
+device.dll!device_update()      device.dll RVA 0x1250
+   · 调用 p4io_get_jamma 填到 device.dll + 0x131A4（32 位缓冲），并做 0x11FEFE 位取反
+   · device.dll!device_get_jamma()（RVA 0x18B0）直接 return device.dll + 0x131A4
+input.dll!input_update()        input.dll RVA 0x1040
+   · 把 JAMMA 缓冲的每一位按固定方式写成 gftools 设备 1 的位（bit 0..0x17）
+     · 空实现（没有硬件）时把这些位清 0
+   · GFInputDDevUpdate(1)
+   · 按 input.dll RVA 0x10AD8 的 16 项表，把设备 1 的位映射成设备 2（16 面板）的位：
+        dev2 bit i  ←  dev1/jamma bit [ 8, 4,19,15,  9, 5,20,16,  10, 6,21,17,  11, 7,22,18 ][i]
+   · GFInputDDevUpdate(2)
+jubeat.dll 读 input.dll!input_panel_trg_on/off/short_on 判定命中；
+本插件读 GFInputDDevGetStateMap(2,1) 的按住位图判定四角（1/4/13/16 = bit 0/3/12/15 = 0x9009）。
+```
+
+关键结论：
+
+- 无论面板输入来自 spice2x 的虚拟按键还是真实 P4IO 板，最终都汇入同一个 dev2 位图，
+  位序由 `input.dll` 的固定表决定，与 IO 来源、机台固件无关。
+- 因此本插件在「实机 p4io + `-exec` 启动」下同样成立；`-exec` 恰好会关掉 spice2x 的
+  IO 模拟/设备钩子，让 `device.dll` 走真实硬件，这正是实机想要的行为。
+- 唯一需要自己确认的是：**游戏版本**（`jubeat.dll` 的 PE 时间戳必须是 `0x6a59f658`）
+  和 `-k` 是否真的执行了（看 `log.txt` 里的 `loading hook DLL`）。
+
+---
+
 ## 8. 验收记录（本机）
 
 - 环境：Windows 10/11，spice2x 32 位启动器，游戏 L44（`jubeat.dll` 时间戳 `0x6a59f658`），本地自建服务器。
