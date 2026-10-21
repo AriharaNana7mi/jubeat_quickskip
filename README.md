@@ -102,6 +102,36 @@ injector.exe --dll path\to\jubeat_quickskip.dll -p <spice.exe 的 PID>
 
 ---
 
+### 与 `-exec` 启动参数的兼容性（实测）
+
+spice2x 的 `-exec <名字>` 用于手动指定游戏 DLL，但它会**跳过游戏自动识别**：
+不会自动把模块目录切到 `modules\`，也不会自动打开 `-io`（IO 模拟）和 `-jb`（jubeat 模块）。
+而且 `-k` 的 DLL 加载发生在 avs 核心/游戏 DLL 加载**之后**，前面一旦致命错误退出，`-k` 根本不会执行。
+
+本机实测矩阵（`jubeat.dll` 时间戳 `0x6a59f658`）：
+
+| 启动参数 | 游戏能启动？ | `-k` 的插件生效？ |
+|---|---|---|
+| 正常启动（不加 `-exec`，自动识别） | ✅ | ✅ |
+| `-exec jubeat.exe` | ❌ 找不到 `avs2-core.dll`（模块目录没切到 `modules\`），进程提前退出 | ❌ `-k` 未执行，插件日志都不会生成 |
+| `-exec jubeat.dll` | ❌ 同样缺少 `-modules modules` | ❌ |
+| `-exec jubeat.dll -modules modules` | ⚠️ 能加载，但黑屏/无虚拟输入（缺 `-io -jb`） | ⚠️ 插件加载并 READY，但读不到面板（一直 0）→ 不会触发 |
+| `-exec jubeat.dll -modules modules -io -jb` | ✅（需手动插卡，见下） | ✅ 实测完整流程可用（+约 0.6 秒回选曲） |
+
+结论：
+
+- **不要用 `-exec jubeat.exe`**：L44 的游戏主体是 `modules\jubeat.dll`，不是 exe。
+- 确实需要 `-exec` 时，正确写法是：
+
+  ```bat
+  spice.exe -exec jubeat.dll -modules modules -io -jb -k "mod_quickskip\bin\jubeat_quickskip.dll" <其余参数>
+  ```
+
+  该组合下开机自动插卡可能不生效，需要在 ENTRY 画面手动插卡（或通过 spice2x API 插卡）后走正常 PIN 流程。
+- 除非有特殊理由（例如排查/硬件环境），建议直接用正常的自动识别启动，`-k` 加载插件即可。
+
+---
+
 ## 配置
 
 `jubeat_quickskip.ini`（放在 DLL 旁边；全部可选）：
