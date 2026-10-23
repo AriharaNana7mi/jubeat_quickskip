@@ -79,7 +79,7 @@ credit/tune bookkeeping stays correct and no play HUD is left over the select sc
 
 > **同时按住 `Keys=` 配置的按键（默认 1、4、13、16）约 0.3 秒**
 > → 本局立即结束（BGM/音效停止，按 FAILED/0 分结算）→ 游戏原生结算 → continue → 选曲，
-> 玩家按键继续到下一首（`AbortMode=31`，默认）。
+> 玩家按键继续到下一首。
 
 - 需要先松开再按才能再次触发；两次触发最小间隔 1.5 秒（可配置）。
 - 被中断的曲目按 **FAILED（0 分）** 结算；因为走的是游戏自己的收尾流程，
@@ -103,7 +103,6 @@ HoldMs=300
 CooldownMs=1500
 MapField=1
 StopSfx=1
-AbortMode=31
 Verbose=0
 ```
 
@@ -115,7 +114,6 @@ Verbose=0
 | `CooldownMs` | `1500` | 两次触发的最小间隔（毫秒） |
 | `MapField` | `1` | 读取面板状态用的字段（本版本实测值，一般不改） |
 | `StopSfx` | `1` | 是否同时停止音效 |
-| `AbortMode` | `31` | 退出方式：`31`=默认（只快速结束当前曲目，之后由游戏原生结算→continue→选曲，玩家按键继续）；`1`=旧版直接切选曲（最快，但会残留游玩 HUD 且会吃掉本局剩余曲数，仅调试用） |
 | `Verbose` | `0` | 记录更多状态变化的日志（排查用） |
 
 `Keys` 示例：
@@ -151,7 +149,7 @@ quickskip: FSM objects READY (play detection active)
 
 ```
 quickskip: TRIGGER keys held 313 ms mask=0x9009 need=0x9009 panels=[1,4,13,16] loop=0x23880000 play=0x23886000 -> abort tune
-quickskip: ABORT mode=31 bgmStopped=1 loopState=0x23880000 playState=0x23886000
+quickskip: ABORT bgmStopped=1 loopState=0x23880000 playState=0x23886000
 quickskip: TUNE(abort-start) count=0 mode=1
 quickskip: TransitState(MUSIC_PLAY->song_end, 0x23887000) called=1 ret=...
 quickskip: play scene ended (loop=0x23880000), waiting for the game's native MUSIC_RESULT
@@ -311,8 +309,8 @@ docs/REVERSE_ENGINEERING.md 逆向笔记与版本移植说明
   2. 修复退出后「整次游玩直接结束、无法进入下一首」的问题（credit/曲数被吃掉）。
   最终方案：触发后**只快速结束当前曲目**（把 `MUSIC_PLAY` 推进到游戏自己的曲终状态 `0x23887000`，
   本局按 FAILED/0 分结算），之后完全交给游戏原生的「结算 → continue → 选曲」流程；
-  玩家按键继续到下一首。这样 HUD 不残留、credit 正确、下一首可正常开始（`AbortMode=31`，默认）。
-  旧的「直接跳选曲」行为仍可用 `AbortMode=1` 复现（仅调试用，会残留 HUD 且会吃掉本局剩余曲数）。
+  玩家按键继续到下一首。这样 HUD 不残留、credit 正确、下一首可正常开始。
+  旧的「直接跳选曲」实现已移除（它会残留游玩 HUD 且吃掉本局剩余曲数），仅作为调试记录保留。
 - 更早：可配置触发按键（`Keys=`）、`-k` 加载方式、实机 p4io 输入路径验证、项目合并进本仓库。
 
 ---

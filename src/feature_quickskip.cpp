@@ -13,7 +13,7 @@
 //  continue -> MUSIC_SELECT flow.  That keeps the credit/tune bookkeeping and
 //  the shared AEP UI layout native (no leftover play HUD, the player simply
 //  walks the settlement screens to the next tune).  See the "abort" section
-//  below; AbortMode=1 keeps the old forced jump for debugging only.
+//  below.
 //
 //  Mechanism (all addresses verified for jubeat.dll build whose
 //  FileHeader.TimeDateStamp = 0x6a59f658, entry RVA 0x210560):
@@ -76,10 +76,7 @@ constexpr uint32_t OBJ_NAME_PTR       = 0x48;
 
 constexpr uint32_t ID_MUSIC_LOOP      = 0x23800000;
 constexpr uint32_t ID_MUSIC_PLAY      = 0x23880000;
-constexpr uint32_t ID_MUSIC_SELECT    = 0x23840000;
 constexpr uint32_t ID_MUSIC_RESULT    = 0x238A0000;  // single-tune result screen
-constexpr uint32_t ID_MUSIC_JUNCTION  = 0x23830000;  // post-tune router junction
-constexpr uint32_t ID_CONTINUE_SELECT = 0x238D0000;  // post-result continue page
 constexpr uint32_t STATE_PLAYING      = 0x23886000;
 constexpr uint32_t DEFAULT_KEYS       = 0x9009;      // panels 1,4,13,16
 // credit / tune bookkeeping globals (VA - 0x10000000)
@@ -95,8 +92,6 @@ struct Config {
     int      mapField     = 1;      // GFInputDDevGetStateMap(2, field)
     bool     stopSfx      = true;   // also stop sound effects on abort
     bool     verbose      = false;  // log every state change
-    int      abortMode    = 31;     // 31 = fast song end + native settlement
-                                    //  1 = legacy forced jump (debug only)
 };
 Config g_cfg;
 
@@ -131,18 +126,13 @@ bool     g_holdConsumed = false;
 volatile LONG g_pendingAbort = 0;  // set by the debug export / remote trigger
 
 bool     g_objectsReady = false;   // FSM singleton objects validated (lazy)
-uint32_t g_abortAtMs = 0;          // when the last abort was requested
-int      g_abortStage = 0;         // 0 idle, 1 waiting for select, 2 waiting result,
-                                   // 3 waiting junction
 uint32_t g_lastObjectTryMs = 0;    // rate limit for lazy validation
 uint32_t g_lastModuleTryMs = 0;    // rate limit for module waiting logs
 
-// abort sequence engine state (AbortMode / remote trigger arg)
-volatile LONG g_modeOverride = 0;  // 0 = use INI AbortMode
-int      g_seqStage = 0;           // see Stage enum below
+// abort sequence state
+int      g_seqStage = 0;           // see SeqStage below
 uint32_t g_seqAtMs = 0;
 uint32_t g_seqFrames = 0;
-int      g_seqMode = 0;
 
 enum SeqStage : int {
     SEQ_NONE = 0,
@@ -394,17 +384,15 @@ void LoadConfig() {
         else if (key == "cooldownms")g_cfg.cooldownMs = (int)v;
         else if (key == "mapfield")  g_cfg.mapField = (int)v;
         else if (key == "stopsfx")   g_cfg.stopSfx = v != 0;
-        else if (key == "abortmode") g_cfg.abortMode = (int)v;
         else if (key == "verbose")   g_cfg.verbose = v != 0;
         else Logf("quickskip: WARN unknown config key '%s'", key.c_str());
     }
     fclose(f);
     Logf("quickskip: config enabled=%d keys=0x%04X panels=[%s] holdMs=%d "
-         "cooldownMs=%d mapField=%d stopSfx=%d verbose=%d abortMode=%d",
+         "cooldownMs=%d mapField=%d stopSfx=%d verbose=%d",
          (int)g_cfg.enabled, g_cfg.keysMask,
          DecodePanels(g_cfg.keysMask).c_str(), g_cfg.holdMs, g_cfg.cooldownMs,
-         g_cfg.mapField, (int)g_cfg.stopSfx, (int)g_cfg.verbose,
-         g_cfg.abortMode);
+         g_cfg.mapField, (int)g_cfg.stopSfx, (int)g_cfg.verbose);
 }
 
 // ---------------------------------------------------------------------------
@@ -486,53 +474,7 @@ void ValidateObjectsDeferred() {
 }
 
 // ---------------------------------------------------------------------------
-//  post-abort verification (for sequences that should end in MUSIC_SELECT)
-// ---------------------------------------------------------------------------
-void CheckAbortProgress() {
-    if (g_abortStage == 0 || !g_loopObj) return;
-    uint32_t now = NowMs();
-    uint32_t loopState = 0;
-    SafeReadU32((uintptr_t)g_loopObj + OBJ_STATE, &loopState);
-
-    if (g_abortStage == 1) {
-        if ((int32_t)(now - g_abortAtMs) < 600) return;
-        if (loopState == ID_MUSIC_PLAY) {
-            Logf("quickskip: abort verify FAILED - MUSIC_LOOP still 0x23880000 "
-                 "after 600 ms, using fallback (MUSIC_RESULT path)");
-            if (g_setNextState) {
-                void* obj = g_loopObj;
-                FnSetNextState f = g_setNextState;
-                GuardedCall("fallback SetNextState(MUSIC_LOOP,MUSIC_RESULT)",
-                            [f, obj]() { f(obj, ID_MUSIC_RESULT); });
-            }
-            g_abortStage = 2;
-            g_abortAtMs = now;
-        } else {
-            Logf("quickskip: abort verify OK - MUSIC_LOOP state now 0x%08X "
-                 "(left MUSIC_PLAY)", loopState);
-            g_abortStage = 0;
-        }
-    } else if (g_abortStage == 2) {
-        if ((int32_t)(now - g_abortAtMs) < 1500) return;
-        Logf("quickskip: fallback result state loop=0x%08X -> requesting "
-             "junction 0x23830000", loopState);
-        if (g_setNextState && loopState == ID_MUSIC_RESULT) {
-            void* obj = g_loopObj;
-            FnSetNextState f = g_setNextState;
-            GuardedCall("fallback SetNextState(MUSIC_LOOP,MUSIC_JUNCTION)",
-                        [f, obj]() { f(obj, ID_MUSIC_JUNCTION); });
-        }
-        g_abortStage = 3;
-        g_abortAtMs = now;
-    } else if (g_abortStage == 3) {
-        if ((int32_t)(now - g_abortAtMs) < 2000) return;
-        Logf("quickskip: fallback final state loop=0x%08X", loopState);
-        g_abortStage = 0;
-    }
-}
-
-// ---------------------------------------------------------------------------
-//  abort: fast song end only (AbortMode=31, default) / legacy jump (mode 1)
+//  abort: fast song end only, then let the game settle natively
 //
 //  The play HUD (song info / "1ST TUNE" / LEVEL / START-END lane) is drawn by
 //  shared AEP UI data sets that the game only re-lays-out while walking its own
@@ -554,12 +496,6 @@ void CheckAbortProgress() {
 //  updated correctly and the shared AEP UI is re-laid-out for the select
 //  screen, so no play HUD is left over.  The player simply walks the native
 //  settlement screens to the next tune.
-//
-//  AbortMode:
-//    31 = default: the behaviour above
-//     1 = legacy: instant forced jump to MUSIC_SELECT (fast but leaves the
-//         play HUD on the select screen and eats the rest of the credit;
-//         debugging only)
 // ---------------------------------------------------------------------------
 void LogTuneCounter(const char* where) {
     uint32_t cnt = 0xDEADBEEF, mode = 0xDEADBEEF;
@@ -583,8 +519,7 @@ bool TransitObj(const char* what, void* obj, uint32_t state) {
     return ok;
 }
 
-void StartAbort(int mode) {
-    g_seqMode = (mode == 1) ? 1 : 31;
+void StartAbort() {
     g_seqStage = SEQ_NONE;
     g_seqFrames = 0;
 
@@ -603,18 +538,11 @@ void StartAbort(int mode) {
     uint32_t loopState = 0, playState = 0;
     if (g_loopObj) SafeReadU32((uintptr_t)g_loopObj + OBJ_STATE, &loopState);
     if (g_playObj) SafeReadU32((uintptr_t)g_playObj + OBJ_STATE, &playState);
-    Logf("quickskip: ABORT mode=%d bgmStopped=%d loopState=0x%08X "
-         "playState=0x%08X", g_seqMode, stopped ? 1 : 0, loopState, playState);
+    Logf("quickskip: ABORT bgmStopped=%d loopState=0x%08X playState=0x%08X",
+         stopped ? 1 : 0, loopState, playState);
     LogTuneCounter("abort-start");
 
-    if (g_seqMode == 1) {
-        TransitObj("MUSIC_LOOP->MUSIC_SELECT", g_loopObj, ID_MUSIC_SELECT);
-        g_abortAtMs = NowMs();
-        g_abortStage = 1;
-        return;
-    }
-
-    // Default: drive the play scene into its own song-end state and hand over.
+    // Drive the play scene into its own song-end state and hand over.
     TransitObj("MUSIC_PLAY->song_end", g_playObj, 0x23887000);
     g_seqStage = SEQ_PLAY_END;
     g_seqAtMs = NowMs();
@@ -659,8 +587,6 @@ void ProgressAbortSequence() {
                  "rest of the settlement flow over to the game");
             LogTuneCounter("result");
             g_seqStage = SEQ_NONE;
-            g_abortStage = 0;
-            g_abortAtMs = now;
             return;
         }
         if (++g_seqFrames % 120 == 0) {
@@ -694,19 +620,13 @@ void __cdecl InputUpdateDetour() {
     // Remote/debug trigger requests (export QuickSkipTriggerNow) are executed
     // here, on the game thread, between two frames.
     if (InterlockedExchange(&g_pendingAbort, 0) != 0) {
-        LONG ovr = InterlockedExchange(&g_modeOverride, 0);
         bool inPlayNow = InSongPlay();
-        Logf("quickskip: remote trigger picked up (inPlay=%d modeOverride=%ld)",
-             inPlayNow ? 1 : 0, (long)ovr);
-        if (inPlayNow) {
-            int mode = (ovr > 0 && ovr <= 40) ? (int)ovr : g_cfg.abortMode;
-            Logf("quickskip: resolved abort mode=%d (override=%ld cfg=%d)", mode, (long)ovr, g_cfg.abortMode);
-            StartAbort(mode);
-        }
+        Logf("quickskip: remote trigger picked up (inPlay=%d)",
+             inPlayNow ? 1 : 0);
+        if (inPlayNow) StartAbort();
     }
 
     uint32_t now = NowMs();
-    CheckAbortProgress();
     ProgressAbortSequence();
     bool inPlay = InSongPlay();
 
@@ -731,7 +651,7 @@ void __cdecl InputUpdateDetour() {
                      "-> abort tune",
                      (unsigned long)heldFor, mask, g_cfg.keysMask,
                      DecodePanels(mask).c_str(), loopState, playState);
-                StartAbort(g_cfg.abortMode);
+                StartAbort();
             }
         } else {
             g_heldSinceMs = 0;
@@ -930,7 +850,6 @@ void OnShutdown() {
 //  public helpers used by the exported test entry points (see bottom)
 // ---------------------------------------------------------------------------
 namespace quickskip {
-void SetModeOverride(int mode) { InterlockedExchange(&g_modeOverride, (LONG)mode); }
 void RequestAbort() {
     InterlockedExchange(&g_pendingAbort, 1);
 }
@@ -952,9 +871,6 @@ uint32_t CurrentPlayState() {
 extern "C" __declspec(dllexport) DWORD WINAPI QuickSkipTriggerNow(DWORD arg) {
     harness::Logf("quickskip: export QuickSkipTriggerNow(arg=%lu) requested",
                   (unsigned long)arg);
-    if (arg >= 1 && arg <= 40) {
-        quickskip::SetModeOverride((int)arg);
-    }
     quickskip::RequestAbort();
     return 1;
 }
