@@ -1,11 +1,16 @@
 # jubeat_quickskip
 
 jubeat Ave. (L44) 的「快速退出」注入插件：
-**游玩中同时按住一组可配置的按键（默认 1、4、13、16 四个角落）约 0.3 秒，立即中断本局并回到选曲界面**（不经过结算）。
+**游玩中同时按住一组可配置的按键（默认 1、4、13、16 四个角落）约 0.3 秒，中断本局并回到选曲界面**。
+退出时会快速走一小段游戏原生的「结算 → continue → 选曲」流程（约 2.8 秒；`AbortMode=15`，也可配置更快的 22/23 变体），
+因此选曲画面**不会残留**游玩时的曲目信息 / `1ST TUNE` / LEVEL / 小节条等 HUD。
 
 A tiny injected DLL for the arcade rhythm game **jubeat Ave. (L44)**: while a tune is being
 played, hold a configurable set of panels (default: the four corners 1, 4, 13, 16) for
-~0.3 seconds to abort the tune and jump straight back to the song select screen.
+~0.3 seconds to abort the tune and return to the song select screen.  The abort walks a
+short prefix of the game's native post-tune chain (result -> continue -> select, ~2.8 s
+with the default `AbortMode=15`) so the shared AEP UI sets are re-laid-out and no play HUD
+is left over the select screen.
 
 - 32 位 DLL，通过 spice2x 自带的 `-k`（Inject DLL Hooks）加载；也附带备用 `injector.exe`。
 - 触发按键**可配置**（`Keys=`，面板 1~16 任意组合）。
@@ -71,10 +76,12 @@ played, hold a configurable set of panels (default: the four corners 1, 4, 13, 1
 游玩中（`MUSIC_PLAY` 状态机处于 `0x23886000`「正在游玩」）：
 
 > **同时按住 `Keys=` 配置的按键（默认 1、4、13、16）约 0.3 秒**
-> → BGM/音效停止 → 回到选曲界面（实测约 0.6 秒）。
+> → BGM/音效停止 → 快速走原生结算/continue 流程 → 回到选曲界面
+> （默认 `AbortMode=15` 实测约 2.8 秒；`22`/`23` 变体约 1.7 / 1.3 秒）。
 
 - 需要先松开再按才能再次触发；两次触发最小间隔 1.5 秒（可配置）。
-- 被中断的曲目不记录成绩、不上传结算数据（练习用定位）。
+- 被中断的曲目会按 **FAILED（0 分）** 走结算流程——这是让游戏自己完成 UI 收尾、
+  避免选曲画面残留 HUD 的代价；不做成绩/上传方面的保证（练习定位）。
 - 中断后可以正常继续选曲、开始下一首。
 - **非游玩状态**（选曲、难度选择、结算、加载/倒计时、标题/演示）按下配置的键**不会触发**，
   只会当作普通面板输入操作游戏；插件不拦截、不改写输入。
@@ -93,6 +100,7 @@ HoldMs=300
 CooldownMs=1500
 MapField=1
 StopSfx=1
+AbortMode=15
 Verbose=0
 ```
 
@@ -104,6 +112,7 @@ Verbose=0
 | `CooldownMs` | `1500` | 两次触发的最小间隔（毫秒） |
 | `MapField` | `1` | 读取面板状态用的字段（本版本实测值，一般不改） |
 | `StopSfx` | `1` | 是否同时停止音效 |
+| `AbortMode` | `15` | 退出方式：`15`=默认（原生结算→continue→选曲，约 2.8 秒，画面干净）；`22`=更快（约 1.7 秒）；`23`=最快（约 1.3 秒）；`1`=旧版直接切选曲（最快，但选曲画面会残留游玩 HUD，不建议） |
 | `Verbose` | `0` | 记录更多状态变化的日志（排查用） |
 
 `Keys` 示例：
@@ -139,7 +148,11 @@ quickskip: FSM objects READY (play detection active)
 
 ```
 quickskip: TRIGGER keys held 313 ms mask=0x9009 need=0x9009 panels=[1,4,13,16] loop=0x23880000 play=0x23886000 -> abort tune
-quickskip: ABORT requested (bgmStopped=1 transitDispatched=1)
+quickskip: ABORT mode=15 bgmStopped=1 loopState=0x23880000 playState=0x23886000
+quickskip: TransitState(MUSIC_LOOP->MUSIC_RESULT, 0x238A0000) called=1 ret=...
+quickskip: mode15 reached MUSIC_RESULT, waiting 30 frames
+quickskip: mode15 result done -> continue page 0x238D0000 (loop=0x238A0000, frames=30)
+quickskip: mode15 continue done -> junction (loop=0x80000004, frames=30)
 quickskip: abort verify OK - MUSIC_LOOP state now 0x23840000 (left MUSIC_PLAY)
 ```
 
@@ -254,9 +267,12 @@ i686-w64-mingw32-g++ -std=c++17 -O2 -static -static-libgcc -static-libstdc++ \
   其状态字节就是当前场景；`MUSIC_PLAY`（id `0x23880000`）状态 `0x23886000` = 正在游玩。
 - 面板位图：`input.dll!input_update()` 每帧刷新 gftools 设备状态表，
   `GFInputDDevGetStateMap(2, 1)` 低 16 位，bit i = 第 i+1 号键；默认四角 = `0x9009`。
-- 退出本局：`sound_bgm_stop()` + `sound_se_stop_all()`，然后
-  `GFFSMObjectTransitState(MUSIC_LOOP, 0x23840000)` 切到 `MUSIC_SELECT`。
-  这是游戏自己「游玩→结算」转移所用的同一条路径，路由器会自己完成子场景的收尾与选曲场景的附着。
+- 退出本局：`sound_bgm_stop()` + `sound_se_stop_all()`，然后按顺序快速走一段
+  原生的「`MUSIC_RESULT`(0x238A0000) → `0x238D0000` continue 页 → junction(0x23830000)
+  → `MUSIC_SELECT`(0x23840000)」状态链。**不能直接跳到 `MUSIC_SELECT`**：游玩时的曲目信息/HUD
+  由一组共享的 AEP UI 数据集合绘制，游戏只在原生的结算后状态链里才把它们重新排布成选曲布局，
+  直接跳会把这些 HUD 留在选曲画面上（本项目最初版本的问题，现已修复）。
+  细节见 [docs/REVERSE_ENGINEERING.md](docs/REVERSE_ENGINEERING.md) §4。
 - 插件 inline hook `input.dll!input_update`，在游戏线程上判断并执行；
   所有游戏调用都有 VEH + `setjmp/longjmp` 保护，出错只跳过并写日志。
 - 容错：中断后约 0.6 秒复查 `MUSIC_LOOP` 状态，未离开游玩则自动改走游戏原生的
@@ -282,6 +298,16 @@ config/jubeat_quickskip.ini 默认配置模板
 build.ps1                   构建脚本（输出到 bin\）
 docs/REVERSE_ENGINEERING.md 逆向笔记与版本移植说明
 ```
+
+---
+
+## 更新记录
+
+- **2026-10**：修复「退出后选曲画面上方残留游玩曲目信息/HUD」的问题。退出改为快速走游戏原生的
+  「结算 → continue → 选曲」状态链（`AbortMode=15`，约 2.8 秒），让游戏自己把共享 AEP UI 重新
+  排布成选曲布局；同时保留 `22`/`23` 两个更快的变体（约 1.7 / 1.3 秒）。旧的「直接跳选曲」行为
+  仍可用 `AbortMode=1` 复现（仅调试用）。
+- 更早：可配置触发按键（`Keys=`）、`-k` 加载方式、实机 p4io 输入路径验证、项目合并进本仓库。
 
 ---
 

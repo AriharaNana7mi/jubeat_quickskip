@@ -159,35 +159,82 @@ uint32_t GFInputDDevGetStateMap(int dev, int field);                            
 
 ## 4. 退出本局的做法（核心结论）
 
-**为什么不能直接给 `MUSIC_LOOP` 发 `0x23840000` 消息**：
-当 `MUSIC_LOOP` 当前状态是 `0x23880000`（游玩中）时，它的消息 switch 只接受
+**为什么不能直接给 `MUSIC_LOOP` 发 `0x23840000` 消息**：当 `MUSIC_LOOP` 当前状态是
+`0x23880000`（游玩中）时，它的消息 switch 只接受
 `{0xB0000002, 0x80000021, 0x80000022, 0xA0000023, 0x90000024}`，其余消息被忽略。
 
-**可行做法：强制状态转移**（`GFFSMObjectTransitState`）：
+**为什么也不能直接 `TransitState(MUSIC_LOOP, 0x23840000)` 跳到选曲**：
+游玩时的曲目信息 / `1ST TUNE` / LEVEL / 小节条等 HUD 并不属于 `MUSIC_PLAY` 子场景，
+而是由一组 **共享的 AEP UI 数据集合** 绘制：
 
-```c
-if (*(uint32_t*)(jubeat + 0xFCA6A0 + 0x14) == 0x23880000 &&   // MUSIC_LOOP 在游玩场景
-    *(uint32_t*)(jubeat + 0xFCA6F8 + 0x14) == 0x23886000) {   // MUSIC_PLAY 正在游玩
-    sound_bgm_stop();        // 正常流程里由 MUSIC_RESULT 场景做
-    sound_se_stop_all();
-    GFFSMObjectTransitState((void*)(jubeat + 0xFCA6A0), 0x23840000); // -> MUSIC_SELECT
-}
+- `MUSIC_LOOP` 路由器状态 `0x23820000` 的进入处理（`jubeat.dll` RVA `0x9BF0B` 起）调用
+  AEP 换集函数（RVA `0x1013D4B0`，`fastcall`：`edx` = 要销毁的名字数组、栈参数 = 要加载的名字数组，
+  以 `NULL` 结束）：
+  - 销毁：`L44AV_JUBIBELL_IMG`
+  - 加载：`L44AV_MUSIC_INFORMATION`、`L44AV_MUSIC_BAR`、`L44AV_PLAY_FOREGROUND`、
+    `L44AV_PLAY_BACKGROUND`、`L44AV_LIGHT_CHAT`
+- 也就是说这些集合在进入音乐循环时只创建一次，之后 select / play / result 各场景只是
+  用同一批 AEP 元素做不同排布。**只有走完原生的「结算 → continue」状态链，游戏才会把这些
+  共享集合重新排布成选曲布局**；从 play 直接强制跳到 select 时，排布仍停留在游玩布局，
+  于是选曲画面上会残留游玩 HUD（本项目 v1 的 bug）。
+
+**可行做法：按顺序快速走一小段原生状态链**（每步用 `GFFSMObjectTransitState`，由插件按帧驱动）：
+
+```
+MUSIC_LOOP 0x23880000 (游玩)
+  -> 0x238A0000  MUSIC_RESULT      (结算场景：附着+初始化，停留约 30 帧)
+  -> 0x238D0000  continue 页       (TOTAL jublity / GET ITEM / LIGHT CHAT，
+                                    停留约 30 帧；AEP 重排/收尾在这里完成)
+  -> 0x23830000  junction          (原生汇合点，游戏自己 SetNextState)
+  -> 0x23840000  MUSIC_SELECT      (选曲)
 ```
 
-`GFFSMObjectTransitState` 会设置 `flags |= 0xC0000000`、`next = state`，然后**同步**派发框架转移消息：
+实测（L44 `0x6a59f658`）：
 
-1. 给 `MUSIC_LOOP` 派发 `0x80000022`（离开旧状态）→ 路由器给 `MUSIC_PLAY` 发 `0x8000001F`
-   并 `fsm_man_unregister_object(0x23880000)`（子场景原生收尾）；
-2. 给 `MUSIC_LOOP` 派发 `0x80000021`（进入新状态）→ 附着并初始化 `MUSIC_SELECT` 子场景。
+| 路径 | 选曲画面残留 HUD？ |
+|---|---|
+| 直接 `play -> 0x23840000` | **残留**（v1 bug） |
+| `play -> 0x238A0000 -> 0x23840000` | 残留 |
+| `play -> 0x23830000(junction)` | 残留 |
+| `play -> 0x238C0000 -> 0x238D0000 -> junction`（跳过结算） | 残留 |
+| **`play -> 0x238A0000 -> 0x238D0000 -> junction`** | **干净**（默认，约 2.8 秒） |
 
-这与游戏自己「游玩 → 结算」的转移是同一条代码路径（`jubeat.dll RVA 0x9D426` 处就是
-`SetNextState(MUSIC_LOOP, 0x238A0000)`），只是目标状态换成 `MUSIC_SELECT`。
+要点：**结算场景 `0x238A0000` 必须先真正进入/初始化**（跳过它不行），
+然后经过 `0x238D0000`（continue 页）时完成 AEP 收尾；最后交给 junction 走原生选曲。
+插件里对应 `AbortMode=15`（30+30 帧）；`AbortMode=22/23` 把停留帧数缩短为 20+15 / 15+8，
+实测更快但仍是同一条链（见 README 配置表）。
 
-**兜底**：若转移后约 0.6 秒仍发现 `MUSIC_LOOP` 停在 `0x23880000`，插件会改走游戏原生路径：
-`SetNextState(0x238A0000)`（结算，会自己停 BGM）→ 1.5 秒后 `SetNextState(0x23830000)`（汇合点）→ 选曲。
+代码骨架：
+
+```c
+// 触发帧（input_update hook 内，游戏线程）：
+sound_bgm_stop(); sound_se_stop_all();
+GFFSMObjectTransitState((void*)(jubeat + 0xFCA6A0), 0x238A0000);
+// 之后每帧：等 MUSIC_LOOP 状态变成 0x238A0000，数 30 帧
+GFFSMObjectTransitState(loopObj, 0x238D0000);
+// 再等 30 帧
+GFFSMObjectTransitState(loopObj, 0x23830000);   // junction -> 游戏自己回选曲
+```
+
+**兜底**：若转移后约 0.6 秒仍发现 `MUSIC_LOOP` 停在 `0x23880000`，插件会改走
+`SetNextState(0x238A0000)`（结算）→ 1.5 秒后 `SetNextState(0x23830000)`（汇合点）→ 选曲。
 
 其他候选（本需求不用）：把 `MUSIC_PLAY` 的 next state 设为 `0x23887000` = 自然曲终；
 `0x80000004` = 直接 finalize；`0x23883000`/`0x23885000` = 重新加载/快速重开（如果以后想做“重开本曲”）。
+
+### 4.1 AEP 数据集合表（调试用）
+
+排查残留时值得记下的结构（`jubeat.dll`，VA 减 `0x10000000` 得 RVA）：
+
+- AEP 对象槽表：`jubeat + 0x4D3F18`，**16 槽 × 0x48 字节**（环形分配，槽号 = 计数器 `% 16`）；
+  槽内 `+0x10` group、`+0x18` 文件大小、`+0x20` 名字（ASCII，最多 31 字节）、`+0x44` in-use 标志。
+- 计数器 / 标志：`jubeat + 0x4D3F0C`。
+- 正在使用的“场景数据集合”体现在槽 0 的名字上：选曲 = `L44AV_SMC_MM`，游玩 = `L44AV_JUBIBELL`
+  （切换场景时槽 0 名字会变，但共享集合元素本身不会因此被销毁——这正是残留的来源）。
+- AEP 换集函数 `0x1013D4B0`；按名字卸载单个集合的函数 `0x1014E890`（`fastcall`，名字在 `ecx`）。
+
+> 注意：外部扫描时这些槽的 in-use/state 字段可能读不到预期值（异步加载/释放），
+> 但 `+0x20` 的名字是可靠的。
 
 ---
 
@@ -302,9 +349,15 @@ jubeat.dll 读 input.dll!input_panel_trg_on/off/short_on 判定命中；
 
 - 环境：Windows 10/11，spice2x 32 位启动器，游戏 L44（`jubeat.dll` 时间戳 `0x6a59f658`），本地自建服务器。
 - 加载方式：spice2x `-k`、`-z`、外部 injector 三种均验证通过。
-- 结果：游玩中按住四角约 0.3 秒 → 约 0.6 秒后回到选曲界面；连续两次触发正常，无黑屏/卡死/崩溃；
-  之后可正常继续选曲并开始下一首。日志中 `abort verify OK - MUSIC_LOOP state now 0x23840000`。
-- 已知副作用：中断的曲目不产生成绩/结算、不上传服务器；选曲界面顶部可能短暂残留“1ST TUNE”HUD 文字。
+- 结果（2026-10，HUD 残留修复后）：游玩中按住四角约 0.3 秒 →
+  约 2.8 秒后回到选曲界面（`AbortMode=15`，包含原生结算/continue 页）；
+  **选曲界面干净**，无游玩曲目信息 / `1ST TUNE` / LEVEL / 小节条残留；
+  之后可正常继续选曲。日志依次出现
+  `TRIGGER ... -> abort tune`、`ABORT mode=15 ...`、
+  `mode15 result done -> continue page 0x238D0000`、`mode15 continue done -> junction`、
+  `abort verify OK - MUSIC_LOOP state now 0x23840000`。
+- 已知副作用：中断的曲目会按 FAILED（0 分）走结算流程（这是让游戏自己完成 UI 收尾的代价）；
+  缓存期（`AbortMode=1`）会残留游玩 HUD，仅保留作调试/对照。
 
 ---
 

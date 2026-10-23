@@ -7,9 +7,12 @@
 //  "PLAYING"), holding a configurable set of panels (default: the four corners
 //  1,4,13,16 => bit mask 0x9009, change with "Keys=" in the INI) for HoldMs
 //  milliseconds aborts the current tune and returns to the song select screen
-//  (MUSIC_SELECT), exactly the way the game itself performs a parent state
-//  transition on a normal play->result change, except we go to MUSIC_SELECT
-//  instead of MUSIC_RESULT.
+//  (MUSIC_SELECT).  The abort walks a short prefix of the game's own post-tune
+//  state chain (MUSIC_RESULT -> 0x238D0000 continue page -> junction ->
+//  MUSIC_SELECT) so the shared AEP UI data sets are laid out for the select
+//  screen; a plain forced jump leaves the play HUD overlaying the select
+//  screen in this build (see "abort sequence engine" below).  The chain costs
+//  ~2.8 s (AbortMode=15); AbortMode=22/23 shorten it to ~1.7 s / ~1.3 s.
 //
 //  Mechanism (all addresses verified for jubeat.dll build whose
 //  FileHeader.TimeDateStamp = 0x6a59f658, entry RVA 0x210560):
@@ -23,15 +26,18 @@
 //                           (MUSIC_LOOP FSM object's current state)
 //                           and *(u32*)(jubeat_base + 0xFCA6F8 + 0x14) == 0x23886000
 //                           (MUSIC_PLAY FSM object's current state = PLAYING)
-//    * Abort              = sound.dll!sound_bgm_stop()
-//                           gftools.dll!GFFSMObjectSetNextState(loopObj,
-//                                                              0x23840000)
-//      The FSM manager processes the next-state request on the next message
-//      loop pass: MUSIC_LOOP leaves the play state (sends the framework
-//      shutdown message to the MUSIC_PLAY child and unregisters it) and enters
-//      MUSIC_SELECT, which loads the jacket list and starts the select scene.
-//      This is the same code path the game uses when it moves play->result
-//      (jubeat RVA 0x9D426), only the target state differs.
+//    * Abort              = sound.dll!sound_bgm_stop() etc., then
+//                           gftools.dll!GFFSMObjectTransitState(MUSIC_LOOP,
+//                              0x238A0000) and a short scripted walk through
+//                           the native post-tune chain:
+//                             0x238A0000 MUSIC_RESULT (result/HUD re-layout)
+//                             0x238D0000 continue page (AEP teardown)
+//                             0x23830000 junction -> MUSIC_SELECT
+//      The shared play-HUD AEP data sets are only re-laid-out for the select
+//      screen by this native chain; a direct jump to MUSIC_SELECT leaves the
+//      play HUD ("1ST TUNE"/LEVEL/song row/lane bar) on top of the select
+//      screen (verified on the real game).  Mode 1 keeps the old direct jump
+//      for debugging only.
 //
 //  Safety
 //  ------
@@ -75,6 +81,9 @@ constexpr uint32_t OBJ_NAME_PTR       = 0x48;
 constexpr uint32_t ID_MUSIC_LOOP      = 0x23800000;
 constexpr uint32_t ID_MUSIC_PLAY      = 0x23880000;
 constexpr uint32_t ID_MUSIC_SELECT    = 0x23840000;
+constexpr uint32_t ID_MUSIC_RESULT    = 0x238A0000;  // single-tune result screen
+constexpr uint32_t ID_MUSIC_JUNCTION  = 0x23830000;  // post-tune router junction
+constexpr uint32_t ID_CONTINUE_SELECT = 0x238D0000;  // post-result continue page
 constexpr uint32_t STATE_PLAYING      = 0x23886000;
 constexpr uint32_t DEFAULT_KEYS       = 0x9009;      // panels 1,4,13,16
 
@@ -87,6 +96,7 @@ struct Config {
     int      mapField     = 1;      // GFInputDDevGetStateMap(2, field)
     bool     stopSfx      = true;   // also stop sound effects on abort
     bool     verbose      = false;  // log every state change
+    int      abortMode    = 15;     // abort sequence variant (see StartAbort)
 };
 Config g_cfg;
 
@@ -126,6 +136,20 @@ int      g_abortStage = 0;         // 0 idle, 1 waiting for select, 2 waiting re
                                    // 3 waiting junction
 uint32_t g_lastObjectTryMs = 0;    // rate limit for lazy validation
 uint32_t g_lastModuleTryMs = 0;    // rate limit for module waiting logs
+
+// abort sequence engine state (AbortMode / remote trigger arg)
+volatile LONG g_modeOverride = 0;  // 0 = use INI AbortMode
+int      g_seqStage = 0;           // see Stage enum below
+uint32_t g_seqAtMs = 0;
+uint32_t g_seqFrames = 0;
+int      g_seqMode = 0;
+
+enum SeqStage : int {
+    SEQ_NONE = 0,
+    SEQ_WAIT_RESULT,          // waiting for MUSIC_LOOP to enter MUSIC_RESULT
+    SEQ_CHAIN_C,              // result shown: wait then -> 0x238D0000
+    SEQ_CHAIN_D               // continue page shown: wait then -> junction
+};
 
 // ---------------------------------------------------------------------------
 //  SEH-ish guard: vectored exception handler + setjmp/longjmp (GCC on i686
@@ -371,15 +395,17 @@ void LoadConfig() {
         else if (key == "cooldownms")g_cfg.cooldownMs = (int)v;
         else if (key == "mapfield")  g_cfg.mapField = (int)v;
         else if (key == "stopsfx")   g_cfg.stopSfx = v != 0;
+        else if (key == "abortmode") g_cfg.abortMode = (int)v;
         else if (key == "verbose")   g_cfg.verbose = v != 0;
         else Logf("quickskip: WARN unknown config key '%s'", key.c_str());
     }
     fclose(f);
     Logf("quickskip: config enabled=%d keys=0x%04X panels=[%s] holdMs=%d "
-         "cooldownMs=%d mapField=%d stopSfx=%d verbose=%d",
+         "cooldownMs=%d mapField=%d stopSfx=%d verbose=%d abortMode=%d",
          (int)g_cfg.enabled, g_cfg.keysMask,
          DecodePanels(g_cfg.keysMask).c_str(), g_cfg.holdMs, g_cfg.cooldownMs,
-         g_cfg.mapField, (int)g_cfg.stopSfx, (int)g_cfg.verbose);
+         g_cfg.mapField, (int)g_cfg.stopSfx, (int)g_cfg.verbose,
+         g_cfg.abortMode);
 }
 
 // ---------------------------------------------------------------------------
@@ -461,15 +487,7 @@ void ValidateObjectsDeferred() {
 }
 
 // ---------------------------------------------------------------------------
-//  post-abort verification / fallback
-//
-//  The primary abort is one forced MUSIC_LOOP transition to MUSIC_SELECT.  If
-//  that ever fails to take effect (e.g. a different game build's handler
-//  refuses it), walk the game's own fallback path instead:
-//    MUSIC_LOOP -> 0x238A0000 (MUSIC_RESULT, stops BGM itself)
-//    after ~1.5 s -> 0x23830000 (post-game junction, routes to MUSIC_SELECT)
-//  All of this is logged so a failed abort can never silently leave the tune
-//  playing with no music.
+//  post-abort verification (for sequences that should end in MUSIC_SELECT)
 // ---------------------------------------------------------------------------
 void CheckAbortProgress() {
     if (g_abortStage == 0 || !g_loopObj) return;
@@ -486,7 +504,7 @@ void CheckAbortProgress() {
                 void* obj = g_loopObj;
                 FnSetNextState f = g_setNextState;
                 GuardedCall("fallback SetNextState(MUSIC_LOOP,MUSIC_RESULT)",
-                            [f, obj]() { f(obj, 0x238A0000u); });
+                            [f, obj]() { f(obj, ID_MUSIC_RESULT); });
             }
             g_abortStage = 2;
             g_abortAtMs = now;
@@ -499,11 +517,11 @@ void CheckAbortProgress() {
         if ((int32_t)(now - g_abortAtMs) < 1500) return;
         Logf("quickskip: fallback result state loop=0x%08X -> requesting "
              "junction 0x23830000", loopState);
-        if (g_setNextState && loopState == 0x238A0000) {
+        if (g_setNextState && loopState == ID_MUSIC_RESULT) {
             void* obj = g_loopObj;
             FnSetNextState f = g_setNextState;
             GuardedCall("fallback SetNextState(MUSIC_LOOP,MUSIC_JUNCTION)",
-                        [f, obj]() { f(obj, 0x23830000u); });
+                        [f, obj]() { f(obj, ID_MUSIC_JUNCTION); });
         }
         g_abortStage = 3;
         g_abortAtMs = now;
@@ -515,11 +533,58 @@ void CheckAbortProgress() {
 }
 
 // ---------------------------------------------------------------------------
-//  abort sequence: stop music and ask MUSIC_LOOP to enter MUSIC_SELECT
+//  abort sequence engine
+//
+//  A plain forced transition MUSIC_LOOP -> MUSIC_SELECT is not enough in this
+//  build.  The play HUD (song info / "1ST TUNE" / LEVEL chip / START-END lane)
+//  is drawn by shared AEP UI data sets; the game only lays them out for the
+//  select screen while walking the native post-tune chain.  Jumping straight
+//  to MUSIC_SELECT therefore leaves the play layout on top of the select
+//  screen.  The mod instead walks a short prefix of the real chain:
+//
+//      MUSIC_RESULT 0x238A0000         (~30 frames / 1 s)
+//        -> 0x238D0000 (continue page) (~30 frames / 1 s; does the AEP teardown)
+//        -> junction  0x23830000       (native routing)
+//        -> MUSIC_SELECT 0x23840000
+//
+//  AbortMode selects the variant:
+//    15 = default: 30 + 30 frames, ~2.8 s from trigger to select
+//    22 = faster : 20 + 15 frames, ~1.7 s
+//    23 = fastest: 15 +  8 frames, ~1.3 s
+//     1 = legacy : immediate MUSIC_SELECT (very fast but leaves the play HUD
+//                  on the select screen in this build; debugging only)
+//
+//  Every game call below is wrapped in GuardedCall(); failures just fall back
+//  to the plain abort (mode 1), so a mismatch can never leave the game stuck.
 // ---------------------------------------------------------------------------
-bool AbortTuneOnce() {
-    if (!g_ready) return false;
+bool TransitObj(const char* what, void* obj, uint32_t state) {
+    if (!g_transitState || !obj) return false;
+    FnTransitState transit = g_transitState;
+    int ret = 0;
+    bool ok = GuardedCall(what, [transit, obj, state, &ret]() {
+        ret = transit(obj, state);
+    });
+    Logf("quickskip: TransitState(%s, 0x%08X) called=%d ret=%d", what, state,
+         ok ? 1 : 0, ret);
+    return ok;
+}
 
+uint32_t ChainWaitResult() {
+    return (g_seqMode == 22) ? 20u : (g_seqMode == 23) ? 15u : 30u;
+}
+
+uint32_t ChainWaitContinue() {
+    return (g_seqMode == 22) ? 15u : (g_seqMode == 23) ? 8u : 30u;
+}
+
+void StartAbort(int mode) {
+    g_seqMode = mode;
+    g_seqStage = SEQ_NONE;
+    g_seqFrames = 0;
+
+    // Stop the music first.  The native result state would do this itself,
+    // but we transition into it immediately, so do it here to avoid a frame
+    // of overlaid play audio.
     bool stopped = false;
     if (g_bgmStop) {
         FnNoArg bgm = g_bgmStop;
@@ -530,21 +595,76 @@ bool AbortTuneOnce() {
         GuardedCall("sound_se_stop_all", [se]() { se(); });
     }
 
-    bool moved = false;
-    if (g_transitState && g_loopObj) {
-        void* obj = g_loopObj;
-        FnTransitState transit = g_transitState;
-        int ret = 0;
-        moved = GuardedCall(
-            "GFFSMObjectTransitState(MUSIC_LOOP,MUSIC_SELECT)",
-            [transit, obj, &ret]() { ret = transit(obj, ID_MUSIC_SELECT); });
-        Logf("quickskip: TransitState returned ret=%d", ret);
+    uint32_t loopState = 0, playState = 0;
+    if (g_loopObj) SafeReadU32((uintptr_t)g_loopObj + OBJ_STATE, &loopState);
+    if (g_playObj) SafeReadU32((uintptr_t)g_playObj + OBJ_STATE, &playState);
+    Logf("quickskip: ABORT mode=%d bgmStopped=%d loopState=0x%08X "
+         "playState=0x%08X", mode, stopped ? 1 : 0, loopState, playState);
+
+    if (mode == 1) {
+        TransitObj("MUSIC_LOOP->MUSIC_SELECT", g_loopObj, ID_MUSIC_SELECT);
+        g_abortAtMs = NowMs();
+        g_abortStage = 1;
+        return;
     }
 
-    Logf("quickskip: ABORT requested (bgmStopped=%d transitDispatched=%d) "
-         "loopObj=%p playObj=%p", stopped ? 1 : 0, moved ? 1 : 0, g_loopObj,
-         g_playObj);
-    return stopped || moved;
+    // Default / 22 / 23: native post-tune chain.
+    g_abortAtMs = NowMs();
+    TransitObj("MUSIC_LOOP->MUSIC_RESULT", g_loopObj, ID_MUSIC_RESULT);
+    g_seqStage = SEQ_WAIT_RESULT;
+    g_seqAtMs = g_abortAtMs;
+}
+
+void ProgressAbortSequence() {
+    if (g_seqStage == SEQ_NONE) return;
+    uint32_t now = NowMs();
+    uint32_t loopState = 0;
+    if (g_loopObj) SafeReadU32((uintptr_t)g_loopObj + OBJ_STATE, &loopState);
+
+    if (g_seqStage == SEQ_WAIT_RESULT) {
+        if ((int32_t)(now - g_seqAtMs) < 100) return;
+        if (loopState != ID_MUSIC_RESULT) {
+            // The router may still be finishing the previous transition; retry.
+            // If it never accepts MUSIC_RESULT (different build), fall back to
+            // the legacy direct jump so the tune is never left playing.
+            if ((int32_t)(now - g_abortAtMs) > 4000) {
+                Logf("quickskip: WARN MUSIC_RESULT timeout (loop=0x%08X), "
+                     "falling back to direct MUSIC_SELECT", loopState);
+                TransitObj("MUSIC_LOOP->MUSIC_SELECT", g_loopObj,
+                           ID_MUSIC_SELECT);
+                g_abortStage = 1;
+                g_abortAtMs = now;
+                g_seqStage = SEQ_NONE;
+            } else {
+                g_seqAtMs = now;
+            }
+            return;
+        }
+        Logf("quickskip: mode%d reached MUSIC_RESULT, waiting %u frames",
+             g_seqMode, ChainWaitResult());
+        g_seqStage = SEQ_CHAIN_C;
+        g_seqFrames = 0;
+        g_seqAtMs = now;
+    } else if (g_seqStage == SEQ_CHAIN_C) {
+        ++g_seqFrames;
+        if (g_seqFrames < ChainWaitResult()) return;
+        Logf("quickskip: mode%d result done -> continue page 0x238D0000 "
+             "(loop=0x%08X, frames=%u)", g_seqMode, loopState, g_seqFrames);
+        TransitObj("MUSIC_LOOP->CONTINUE_SELECT(0x238D0000)", g_loopObj,
+                   ID_CONTINUE_SELECT);
+        g_seqStage = SEQ_CHAIN_D;
+        g_seqFrames = 0;
+        g_seqAtMs = now;
+    } else if (g_seqStage == SEQ_CHAIN_D) {
+        ++g_seqFrames;
+        if (g_seqFrames < ChainWaitContinue()) return;
+        Logf("quickskip: mode%d continue done -> junction (loop=0x%08X, "
+             "frames=%u)", g_seqMode, loopState, g_seqFrames);
+        TransitObj("MUSIC_LOOP->MUSIC_JUNCTION", g_loopObj, ID_MUSIC_JUNCTION);
+        g_abortAtMs = NowMs();
+        g_abortStage = 1;
+        g_seqStage = SEQ_NONE;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -565,13 +685,19 @@ void __cdecl InputUpdateDetour() {
     // Remote/debug trigger requests (export QuickSkipTriggerNow) are executed
     // here, on the game thread, between two frames.
     if (InterlockedExchange(&g_pendingAbort, 0) != 0) {
+        LONG ovr = InterlockedExchange(&g_modeOverride, 0);
         bool inPlayNow = InSongPlay();
-        Logf("quickskip: remote trigger picked up (inPlay=%d)", inPlayNow ? 1 : 0);
-        if (inPlayNow) AbortTuneOnce();
+        Logf("quickskip: remote trigger picked up (inPlay=%d modeOverride=%ld)",
+             inPlayNow ? 1 : 0, (long)ovr);
+        if (inPlayNow) {
+            int mode = (ovr > 0 && ovr <= 20) ? (int)ovr : g_cfg.abortMode;
+            StartAbort(mode);
+        }
     }
 
     uint32_t now = NowMs();
     CheckAbortProgress();
+    ProgressAbortSequence();
     bool inPlay = InSongPlay();
 
     if (inPlay) {
@@ -595,9 +721,7 @@ void __cdecl InputUpdateDetour() {
                      "-> abort tune",
                      (unsigned long)heldFor, mask, g_cfg.keysMask,
                      DecodePanels(mask).c_str(), loopState, playState);
-                g_abortAtMs = now;
-                g_abortStage = 1;
-                AbortTuneOnce();
+                StartAbort(g_cfg.abortMode);
             }
         } else {
             g_heldSinceMs = 0;
@@ -796,6 +920,7 @@ void OnShutdown() {
 //  public helpers used by the exported test entry points (see bottom)
 // ---------------------------------------------------------------------------
 namespace quickskip {
+void SetModeOverride(int mode) { InterlockedExchange(&g_modeOverride, (LONG)mode); }
 void RequestAbort() {
     InterlockedExchange(&g_pendingAbort, 1);
 }
@@ -817,6 +942,9 @@ uint32_t CurrentPlayState() {
 extern "C" __declspec(dllexport) DWORD WINAPI QuickSkipTriggerNow(DWORD arg) {
     harness::Logf("quickskip: export QuickSkipTriggerNow(arg=%lu) requested",
                   (unsigned long)arg);
+    if (arg >= 1 && arg <= 23) {
+        quickskip::SetModeOverride((int)arg);
+    }
     quickskip::RequestAbort();
     return 1;
 }
