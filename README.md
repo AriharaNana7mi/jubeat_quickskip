@@ -103,7 +103,7 @@ HoldMs=300
 CooldownMs=1500
 MapField=1
 StopSfx=1
-AbortMode=15
+AbortMode=31
 Verbose=0
 ```
 
