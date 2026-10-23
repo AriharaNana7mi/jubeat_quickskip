@@ -1,16 +1,18 @@
 # jubeat_quickskip
 
 jubeat Ave. (L44) 的「快速退出」注入插件：
-**游玩中同时按住一组可配置的按键（默认 1、4、13、16 四个角落）约 0.3 秒，中断本局并回到选曲界面**。
-退出时会快速走一小段游戏原生的「结算 → continue → 选曲」流程（约 2.8 秒；`AbortMode=15`，也可配置更快的 22/23 变体），
-因此选曲画面**不会残留**游玩时的曲目信息 / `1ST TUNE` / LEVEL / 小节条等 HUD。
+**游玩中同时按住一组可配置的按键（默认 1、4、13、16 四个角落）约 0.3 秒，立即结束本局**：
+BGM/音效停止、当前曲目按 FAILED（0 分）结算，然后由游戏自己走原生的「结算 → continue → 选曲」流程，
+玩家按 NEXT/面板继续到下一首即可。
+因为完全交给游戏原生处理，**选曲画面不会残留**游玩时的曲目信息 / `1ST TUNE` / LEVEL / 小节条等 HUD，
+本局剩余的曲数（credit）也会正确保留，可以继续下一首。
 
 A tiny injected DLL for the arcade rhythm game **jubeat Ave. (L44)**: while a tune is being
 played, hold a configurable set of panels (default: the four corners 1, 4, 13, 16) for
-~0.3 seconds to abort the tune and return to the song select screen.  The abort walks a
-short prefix of the game's native post-tune chain (result -> continue -> select, ~2.8 s
-with the default `AbortMode=15`) so the shared AEP UI sets are re-laid-out and no play HUD
-is left over the select screen.
+~0.3 seconds to immediately end the current tune (it settles as FAILED / 0 score) and let
+the game run its own native result -> continue -> song-select flow; the player walks the
+settlement screens to the next tune.  Because the post-tune flow is fully native, the
+credit/tune bookkeeping stays correct and no play HUD is left over the select screen.
 
 - 32 位 DLL，通过 spice2x 自带的 `-k`（Inject DLL Hooks）加载；也附带备用 `injector.exe`。
 - 触发按键**可配置**（`Keys=`，面板 1~16 任意组合）。
@@ -76,13 +78,14 @@ is left over the select screen.
 游玩中（`MUSIC_PLAY` 状态机处于 `0x23886000`「正在游玩」）：
 
 > **同时按住 `Keys=` 配置的按键（默认 1、4、13、16）约 0.3 秒**
-> → BGM/音效停止 → 快速走原生结算/continue 流程 → 回到选曲界面
-> （默认 `AbortMode=15` 实测约 2.8 秒；`22`/`23` 变体约 1.7 / 1.3 秒）。
+> → 本局立即结束（BGM/音效停止，按 FAILED/0 分结算）→ 游戏原生结算 → continue → 选曲，
+> 玩家按键继续到下一首（`AbortMode=31`，默认）。
 
 - 需要先松开再按才能再次触发；两次触发最小间隔 1.5 秒（可配置）。
-- 被中断的曲目会按 **FAILED（0 分）** 走结算流程——这是让游戏自己完成 UI 收尾、
-  避免选曲画面残留 HUD 的代价；不做成绩/上传方面的保证（练习定位）。
+- 被中断的曲目按 **FAILED（0 分）** 结算；因为走的是游戏自己的收尾流程，
+  本局剩余曲数（credit）、下一首的选择、成绩/次数统计都由游戏原生逻辑处理。
 - 中断后可以正常继续选曲、开始下一首。
+- 退出后 **不会** 残留游玩时的曲目信息/HUD，也不会吃掉本局剩下的曲数。
 - **非游玩状态**（选曲、难度选择、结算、加载/倒计时、标题/演示）按下配置的键**不会触发**，
   只会当作普通面板输入操作游戏；插件不拦截、不改写输入。
 
@@ -112,7 +115,7 @@ Verbose=0
 | `CooldownMs` | `1500` | 两次触发的最小间隔（毫秒） |
 | `MapField` | `1` | 读取面板状态用的字段（本版本实测值，一般不改） |
 | `StopSfx` | `1` | 是否同时停止音效 |
-| `AbortMode` | `15` | 退出方式：`15`=默认（原生结算→continue→选曲，约 2.8 秒，画面干净）；`22`=更快（约 1.7 秒）；`23`=最快（约 1.3 秒）；`1`=旧版直接切选曲（最快，但选曲画面会残留游玩 HUD，不建议） |
+| `AbortMode` | `31` | 退出方式：`31`=默认（只快速结束当前曲目，之后由游戏原生结算→continue→选曲，玩家按键继续）；`1`=旧版直接切选曲（最快，但会残留游玩 HUD 且会吃掉本局剩余曲数，仅调试用） |
 | `Verbose` | `0` | 记录更多状态变化的日志（排查用） |
 
 `Keys` 示例：
@@ -148,12 +151,11 @@ quickskip: FSM objects READY (play detection active)
 
 ```
 quickskip: TRIGGER keys held 313 ms mask=0x9009 need=0x9009 panels=[1,4,13,16] loop=0x23880000 play=0x23886000 -> abort tune
-quickskip: ABORT mode=15 bgmStopped=1 loopState=0x23880000 playState=0x23886000
-quickskip: TransitState(MUSIC_LOOP->MUSIC_RESULT, 0x238A0000) called=1 ret=...
-quickskip: mode15 reached MUSIC_RESULT, waiting 30 frames
-quickskip: mode15 result done -> continue page 0x238D0000 (loop=0x238A0000, frames=30)
-quickskip: mode15 continue done -> junction (loop=0x80000004, frames=30)
-quickskip: abort verify OK - MUSIC_LOOP state now 0x23840000 (left MUSIC_PLAY)
+quickskip: ABORT mode=31 bgmStopped=1 loopState=0x23880000 playState=0x23886000
+quickskip: TUNE(abort-start) count=0 mode=1
+quickskip: TransitState(MUSIC_PLAY->song_end, 0x23887000) called=1 ret=...
+quickskip: play scene ended (loop=0x23880000), waiting for the game's native MUSIC_RESULT
+quickskip: game entered MUSIC_RESULT natively - handing the rest of the settlement flow over to the game
 ```
 
 常见情况：
@@ -267,12 +269,13 @@ i686-w64-mingw32-g++ -std=c++17 -O2 -static -static-libgcc -static-libstdc++ \
   其状态字节就是当前场景；`MUSIC_PLAY`（id `0x23880000`）状态 `0x23886000` = 正在游玩。
 - 面板位图：`input.dll!input_update()` 每帧刷新 gftools 设备状态表，
   `GFInputDDevGetStateMap(2, 1)` 低 16 位，bit i = 第 i+1 号键；默认四角 = `0x9009`。
-- 退出本局：`sound_bgm_stop()` + `sound_se_stop_all()`，然后按顺序快速走一段
-  原生的「`MUSIC_RESULT`(0x238A0000) → `0x238D0000` continue 页 → junction(0x23830000)
-  → `MUSIC_SELECT`(0x23840000)」状态链。**不能直接跳到 `MUSIC_SELECT`**：游玩时的曲目信息/HUD
-  由一组共享的 AEP UI 数据集合绘制，游戏只在原生的结算后状态链里才把它们重新排布成选曲布局，
-  直接跳会把这些 HUD 留在选曲画面上（本项目最初版本的问题，现已修复）。
-  细节见 [docs/REVERSE_ENGINEERING.md](docs/REVERSE_ENGINEERING.md) §4。
+- 退出本局：`sound_bgm_stop()` + `sound_se_stop_all()`，然后只把 `MUSIC_PLAY` 推进到游戏自己的
+  「曲终」状态 `0x23887000`，**之后什么都不做**——结算、continue、回到选曲全部由游戏原生状态机完成。
+  这样本局按 FAILED/0 分正常结算、credit/曲数统计正确、共享 AEP UI 也会按原生流程重排，
+  不会残留游玩 HUD，也不会吃掉本局剩下的曲数。
+  **不要**强行把 `MUSIC_LOOP` 直接切到 `MUSIC_SELECT`，也不要强行跳过结算/continue：
+  前者会把游玩 HUD 留在选曲画面上，后者会破坏 credit 统计（游戏会直接结束整次游玩）。
+  细节与失败方案记录见 [docs/REVERSE_ENGINEERING.md](docs/REVERSE_ENGINEERING.md) §4。
 - 插件 inline hook `input.dll!input_update`，在游戏线程上判断并执行；
   所有游戏调用都有 VEH + `setjmp/longjmp` 保护，出错只跳过并写日志。
 - 容错：中断后约 0.6 秒复查 `MUSIC_LOOP` 状态，未离开游玩则自动改走游戏原生的
@@ -303,10 +306,13 @@ docs/REVERSE_ENGINEERING.md 逆向笔记与版本移植说明
 
 ## 更新记录
 
-- **2026-10**：修复「退出后选曲画面上方残留游玩曲目信息/HUD」的问题。退出改为快速走游戏原生的
-  「结算 → continue → 选曲」状态链（`AbortMode=15`，约 2.8 秒），让游戏自己把共享 AEP UI 重新
-  排布成选曲布局；同时保留 `22`/`23` 两个更快的变体（约 1.7 / 1.3 秒）。旧的「直接跳选曲」行为
-  仍可用 `AbortMode=1` 复现（仅调试用）。
+- **2026-10**：
+  1. 修复「退出后选曲画面上方残留游玩曲目信息/HUD」的问题。
+  2. 修复退出后「整次游玩直接结束、无法进入下一首」的问题（credit/曲数被吃掉）。
+  最终方案：触发后**只快速结束当前曲目**（把 `MUSIC_PLAY` 推进到游戏自己的曲终状态 `0x23887000`，
+  本局按 FAILED/0 分结算），之后完全交给游戏原生的「结算 → continue → 选曲」流程；
+  玩家按键继续到下一首。这样 HUD 不残留、credit 正确、下一首可正常开始（`AbortMode=31`，默认）。
+  旧的「直接跳选曲」行为仍可用 `AbortMode=1` 复现（仅调试用，会残留 HUD 且会吃掉本局剩余曲数）。
 - 更早：可配置触发按键（`Keys=`）、`-k` 加载方式、实机 p4io 输入路径验证、项目合并进本仓库。
 
 ---

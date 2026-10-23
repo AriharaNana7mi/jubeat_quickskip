@@ -159,82 +159,63 @@ uint32_t GFInputDDevGetStateMap(int dev, int field);                            
 
 ## 4. 退出本局的做法（核心结论）
 
-**为什么不能直接给 `MUSIC_LOOP` 发 `0x23840000` 消息**：当 `MUSIC_LOOP` 当前状态是
-`0x23880000`（游玩中）时，它的消息 switch 只接受
-`{0xB0000002, 0x80000021, 0x80000022, 0xA0000023, 0x90000024}`，其余消息被忽略。
-
-**为什么也不能直接 `TransitState(MUSIC_LOOP, 0x23840000)` 跳到选曲**：
-游玩时的曲目信息 / `1ST TUNE` / LEVEL / 小节条等 HUD 并不属于 `MUSIC_PLAY` 子场景，
-而是由一组 **共享的 AEP UI 数据集合** 绘制：
-
-- `MUSIC_LOOP` 路由器状态 `0x23820000` 的进入处理（`jubeat.dll` RVA `0x9BF0B` 起）调用
-  AEP 换集函数（RVA `0x1013D4B0`，`fastcall`：`edx` = 要销毁的名字数组、栈参数 = 要加载的名字数组，
-  以 `NULL` 结束）：
-  - 销毁：`L44AV_JUBIBELL_IMG`
-  - 加载：`L44AV_MUSIC_INFORMATION`、`L44AV_MUSIC_BAR`、`L44AV_PLAY_FOREGROUND`、
-    `L44AV_PLAY_BACKGROUND`、`L44AV_LIGHT_CHAT`
-- 也就是说这些集合在进入音乐循环时只创建一次，之后 select / play / result 各场景只是
-  用同一批 AEP 元素做不同排布。**只有走完原生的「结算 → continue」状态链，游戏才会把这些
-  共享集合重新排布成选曲布局**；从 play 直接强制跳到 select 时，排布仍停留在游玩布局，
-  于是选曲画面上会残留游玩 HUD（本项目 v1 的 bug）。
-
-**可行做法：按顺序快速走一小段原生状态链**（每步用 `GFFSMObjectTransitState`，由插件按帧驱动）：
-
-```
-MUSIC_LOOP 0x23880000 (游玩)
-  -> 0x238A0000  MUSIC_RESULT      (结算场景：附着+初始化，停留约 30 帧)
-  -> 0x238D0000  continue 页       (TOTAL jublity / GET ITEM / LIGHT CHAT，
-                                    停留约 30 帧；AEP 重排/收尾在这里完成)
-  -> 0x23830000  junction          (原生汇合点，游戏自己 SetNextState)
-  -> 0x23840000  MUSIC_SELECT      (选曲)
-```
-
-实测（L44 `0x6a59f658`）：
-
-| 路径 | 选曲画面残留 HUD？ |
-|---|---|
-| 直接 `play -> 0x23840000` | **残留**（v1 bug） |
-| `play -> 0x238A0000 -> 0x23840000` | 残留 |
-| `play -> 0x23830000(junction)` | 残留 |
-| `play -> 0x238C0000 -> 0x238D0000 -> junction`（跳过结算） | 残留 |
-| **`play -> 0x238A0000 -> 0x238D0000 -> junction`** | **干净**（默认，约 2.8 秒） |
-
-要点：**结算场景 `0x238A0000` 必须先真正进入/初始化**（跳过它不行），
-然后经过 `0x238D0000`（continue 页）时完成 AEP 收尾；最后交给 junction 走原生选曲。
-插件里对应 `AbortMode=15`（30+30 帧）；`AbortMode=22/23` 把停留帧数缩短为 20+15 / 15+8，
-实测更快但仍是同一条链（见 README 配置表）。
-
-代码骨架：
+**先说结论**：触发后**只把 `MUSIC_PLAY` 推进到游戏自己的「曲终」状态 `0x23887000`，然后什么都不要做**。
+游戏会自己完成结算、continue、回到选曲，本局按 FAILED（0 分）结算，credit/曲数统计和 UI 都是原生的。
 
 ```c
-// 触发帧（input_update hook 内，游戏线程）：
-sound_bgm_stop(); sound_se_stop_all();
-GFFSMObjectTransitState((void*)(jubeat + 0xFCA6A0), 0x238A0000);
-// 之后每帧：等 MUSIC_LOOP 状态变成 0x238A0000，数 30 帧
-GFFSMObjectTransitState(loopObj, 0x238D0000);
-// 再等 30 帧
-GFFSMObjectTransitState(loopObj, 0x23830000);   // junction -> 游戏自己回选曲
+sound_bgm_stop();          // 本局要中断，先停音乐
+sound_se_stop_all();
+GFFSMObjectTransitState(playObj, 0x23887000);   // 游戏自己的「本曲结束」状态
+// 之后不要再改 MUSIC_LOOP / MUSIC_PLAY 的状态
 ```
 
-**兜底**：若转移后约 0.6 秒仍发现 `MUSIC_LOOP` 停在 `0x23880000`，插件会改走
-`SetNextState(0x238A0000)`（结算）→ 1.5 秒后 `SetNextState(0x23830000)`（汇合点）→ 选曲。
+### 4.1 为什么不能直接跳 `MUSIC_SELECT`
 
-其他候选（本需求不用）：把 `MUSIC_PLAY` 的 next state 设为 `0x23887000` = 自然曲终；
-`0x80000004` = 直接 finalize；`0x23883000`/`0x23885000` = 重新加载/快速重开（如果以后想做“重开本曲”）。
+`MUSIC_LOOP` 当前状态是 `0x23880000`（游玩中）时，消息 switch 只接受
+`{0xB0000002, 0x80000021, 0x80000022, 0xA0000023, 0x90000024}`，其它消息被忽略，
+所以只能走状态转移。但直接 `TransitState(MUSIC_LOOP, 0x23840000)`（旧版做法）有两个问题：
 
-### 4.1 AEP 数据集合表（调试用）
+1. **选曲画面残留游玩 HUD**：游玩时的曲目信息 / `1ST TUNE` / LEVEL / 小节条属于**共享的 AEP UI
+   数据集合**（见 §4.3），游戏只在原生的「结算之后」状态链里才把它们重新排布成选曲布局，
+   直接跳就会把游玩布局留在选曲画面上。
+2. **吃掉本局剩下的曲数**：本局的曲数/credit 记账只在游戏原生的结算流程里完成，
+   强行跳转会破坏它，之后游戏会认为整次游玩已经结束（弹 CONTINUE? 然后回 Start CREDIT）。
 
-排查残留时值得记下的结构（`jubeat.dll`，VA 减 `0x10000000` 得 RVA）：
+### 4.2 也试过但不可行的方案（均在本机 L44 `0x6a59f658` 实测）
 
-- AEP 对象槽表：`jubeat + 0x4D3F18`，**16 槽 × 0x48 字节**（环形分配，槽号 = 计数器 `% 16`）；
-  槽内 `+0x10` group、`+0x18` 文件大小、`+0x20` 名字（ASCII，最多 31 字节）、`+0x44` in-use 标志。
-- 计数器 / 标志：`jubeat + 0x4D3F0C`。
-- 正在使用的“场景数据集合”体现在槽 0 的名字上：选曲 = `L44AV_SMC_MM`，游玩 = `L44AV_JUBIBELL`
-  （切换场景时槽 0 名字会变，但共享集合元素本身不会因此被销毁——这正是残留的来源）。
-- AEP 换集函数 `0x1013D4B0`；按名字卸载单个集合的函数 `0x1014E890`（`fastcall`，名字在 `ecx`）。
+| 方案 | 选曲 HUD | credit/下一首 |
+|---|---|---|
+| `play -> MUSIC_SELECT`（旧版 mode 1） | **残留** | 被吃掉 |
+| `play -> MUSIC_RESULT -> MUSIC_SELECT` | 残留 | 被吃掉 |
+| `play -> MUSIC_RESULT -> 0x238D0000 continue -> junction -> select`（mode 15） | 干净 | **被吃掉**（CONTINUE? → Start CREDIT） |
+| `play -> junction 0x23830000` | 残留 | 被吃掉 |
+| 先强行 playing->song_end，再由我们自己强推后续状态 | 不可靠 | 不可靠 |
+| 强行把结果场景 child finalize（mode 30） | 结算页干净，回不到 select | 最终仍被吃掉 |
+| **只强制 `play -> 0x23887000`，之后不干预（mode 31，最终方案）** | **干净** | **正常，可继续下一首** |
 
-> 注意：外部扫描时这些槽的 in-use/state 字段可能读不到预期值（异步加载/释放），
-> 但 `+0x20` 的名字是可靠的。
+原因：`MUSIC_PLAY` 自己的「曲终」状态 `0x23887000` 会跑游戏真正的收尾逻辑（finalize、成绩/存档、
+tune 计数等）。这一步是 credit 记账的关键；跳过它（直接跳 result/select）就会丢曲数。
+
+### 4.3 关键状态与计数（排查用）
+
+- `MUSIC_PLAY` 状态链：`0x23886000` 游玩中 → `0x23887000` 曲终 → `0x80000004` finalize（对象不再运行）。
+- `MUSIC_LOOP` 状态：`0x23880000` 游玩 → `0x238A0000` 结算 → `0x238C0000`/`0x238D0000` continue 页 →
+  `0x23830000` junction → `0x23840000` 选曲；`0x238B0000` = LIGHT_CHAT_SELECT。
+- 本局曲数计数 `jubeat + 0x1243BB4`（`0x11243BB4`，clamp 0..6）：
+  - 只在进入 continue 页 `0x238D0000` 时 `+1`（`jubeat RVA 0x9DCAB` 调 `0xE29F0`，
+    且 `env_is_build_user()` 为真时**不**加——调试/构建用户模式下不计数）；
+  - junction 用它决定下一站：`>0` → 选曲，`==0` → `0x238B0000`（LIGHT_CHAT_SELECT）。
+- 同时还有一个会话计数 `jubeat + 0xFC3068`（`0x10FC3068`）和 continue 页一起 `+1`。
+- 可用曲数：`coin.dll!coin_get_playable_tune_num(mode)`，经 `jubeat RVA 0xE2940` 的 getter
+  按 `0x11243BB0` 的模式取值（本机 3 曲 credit 时各模式返回 `[3,2,3,3]`）。
+- `0x238D0000` continue 页的进入处理还会读表 `0x11287606 + min(count,5)*0xF0` 决定后续分支，
+  并据此决定是回 junction 还是走 `0x238F0000` 的过渡/结束流程——这也是为什么强行跳过结算会出事。
+
+### 4.4 退出后的表现（最终方案）
+
+- 本局立即结束（BGM/音效停止），结算页显示 FAILED / 0 分；
+- 玩家按 NEXT/面板走过原生结算和 continue 页，回到选曲；
+- 选曲画面干净、本局剩余曲数正确保留，可以继续下一首、直到 FINAL TUNE。
 
 ---
 
@@ -349,21 +330,18 @@ jubeat.dll 读 input.dll!input_panel_trg_on/off/short_on 判定命中；
 
 - 环境：Windows 10/11，spice2x 32 位启动器，游戏 L44（`jubeat.dll` 时间戳 `0x6a59f658`），本地自建服务器。
 - 加载方式：spice2x `-k`、`-z`、外部 injector 三种均验证通过。
-- 结果（2026-10，HUD 残留修复后）：游玩中按住四角约 0.3 秒 →
-  约 2.8 秒后回到选曲界面（`AbortMode=15`，包含原生结算/continue 页）；
-  **选曲界面干净**，无游玩曲目信息 / `1ST TUNE` / LEVEL / 小节条残留；
-  之后可正常继续选曲。日志依次出现
-  `TRIGGER ... -> abort tune`、`ABORT mode=15 ...`、
-  `mode15 result done -> continue page 0x238D0000`、`mode15 continue done -> junction`、
-  `abort verify OK - MUSIC_LOOP state now 0x23840000`。
-- 最终发布构建实机复核（2026-10-23，`jubeat_quickskip.dll` 850,294 B，
-  SHA256 `0B40B5A179AD7DAA9CCFC7D8F6E754D2D9DA5D5D4F619056EAEE03A4729B5CEB`）：
-  通过 `-k` 加载、配置解析 `abortMode=15`、`READY` 正常；游玩 ADVANCED 5 中触发一次，
-  日志 `ABORT mode=15` → `result done -> continue page 0x238D0000` → `continue done -> junction`
-  → `abort verify OK ... 0x23840000`，触发到选曲约 **2.77 s**；之后截图为原生 continue 页
-  （TOTAL jublity / GET ITEM / LIGHT CHAT），**无任何游玩 HUD 残留**，无黑屏/卡死/输入锁死。
-- 已知副作用：中断的曲目会按 FAILED（0 分）走结算流程（这是让游戏自己完成 UI 收尾的代价）；
-  旧模式（`AbortMode=1`）会残留游玩 HUD，仅保留作调试/对照。
+- **最终发布构建**（`jubeat_quickskip.dll` 850,380 B，SHA256
+  `BEC549AAB0A6827944D94915C85C6034697FD9BC2C8054D3ABB32E8F96D08344`，2026-10-24）实机验证：
+  - 3 曲 credit（`1ST TUNE`），真实按住四角 1/4/13/16 约 0.3 秒：
+    日志 `TRIGGER ... -> abort tune` → `ABORT mode=31` → `TransitState(MUSIC_PLAY->song_end, 0x23887000)`
+    → `play scene ended ... waiting for the game's native MUSIC_RESULT`
+    → `game entered MUSIC_RESULT natively - handing ... over to the game`，之后插件不再有任何状态操作。
+  - 本局按 FAILED（0 分）结算；玩家按 NEXT 走过原生结算/continue 页 → 回到选曲；
+    **选曲画面无任何游玩 HUD 残留**；本局剩余曲数正确，可正常开始第 2 首，重复触发可到 FINAL TUNE。
+  - 计数核对：tune1 触发时 `count=0`，原生结算后 tune2 触发时 `count=1`；可用曲数 `[3,2,3,3]` 不变。
+  - 插件自身动作耗时约 0.16 秒（触发→交接）；剩余时间是游戏原生结算/continue 的展示。
+- 已知副作用：被中断的曲目按 FAILED（0 分）结算；退出后需要玩家自己按键走过结算/continue 画面。
+  `AbortMode=1`（旧版直接跳选曲）会残留 HUD 且吃掉本局剩余曲数，仅保留作调试对照。
 
 ---
 
