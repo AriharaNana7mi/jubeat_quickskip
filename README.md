@@ -1,6 +1,6 @@
 # jubeat_quickskip
 
-32 位 DLL。用 **i686** MinGW-w64 g++（GCC 8+；已验证 i686-ucrt-posix-dwarf 16.2.0）构建。
+32-bit DLL。用 **i686** MinGW-w64 g++（GCC 8+；已验证 i686-ucrt-posix-dwarf 16.2.0）构建。
 产物必须是 PE32 / i386。
 
 ## Windows
