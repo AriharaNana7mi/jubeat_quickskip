@@ -356,8 +356,14 @@ jubeat.dll 读 input.dll!input_panel_trg_on/off/short_on 判定命中；
   `TRIGGER ... -> abort tune`、`ABORT mode=15 ...`、
   `mode15 result done -> continue page 0x238D0000`、`mode15 continue done -> junction`、
   `abort verify OK - MUSIC_LOOP state now 0x23840000`。
+- 最终发布构建实机复核（2026-10-23，`jubeat_quickskip.dll` 850,294 B，
+  SHA256 `0B40B5A179AD7DAA9CCFC7D8F6E754D2D9DA5D5D4F619056EAEE03A4729B5CEB`）：
+  通过 `-k` 加载、配置解析 `abortMode=15`、`READY` 正常；游玩 ADVANCED 5 中触发一次，
+  日志 `ABORT mode=15` → `result done -> continue page 0x238D0000` → `continue done -> junction`
+  → `abort verify OK ... 0x23840000`，触发到选曲约 **2.77 s**；之后截图为原生 continue 页
+  （TOTAL jublity / GET ITEM / LIGHT CHAT），**无任何游玩 HUD 残留**，无黑屏/卡死/输入锁死。
 - 已知副作用：中断的曲目会按 FAILED（0 分）走结算流程（这是让游戏自己完成 UI 收尾的代价）；
-  缓存期（`AbortMode=1`）会残留游玩 HUD，仅保留作调试/对照。
+  旧模式（`AbortMode=1`）会残留游玩 HUD，仅保留作调试/对照。
 
 ---
 
